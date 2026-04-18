@@ -1,20 +1,20 @@
 """
-🤖 بوت التقديم على الوظائف — Telegram
-=======================================
-• إعداد الحساب (إيميل + كلمة مرور التطبيقات)
+🤖 بوت التقديم على الوظائف — Telegram + SendGrid
+=================================================
+• إعداد الحساب (إيميلك + SendGrid API Key)
 • إضافة مسميات وظيفية مع موضوع + رسالة + CV
 • تقديم جديد: اختر المسمى ← أدخل إيميل الشركة ← يرسل تلقائياً
 """
 
-import os, json, smtplib, logging
+import os, json, logging, base64
 from pathlib import Path
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
 
+import sendgrid
+from sendgrid.helpers.mail import (
+    Mail, Attachment, FileContent, FileName, FileType, Disposition
+)
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardRemove
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # ─── Config ────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN_HERE")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 DATA_DIR  = Path("data")
 CV_DIR    = DATA_DIR / "cvs"
 DATA_FILE = DATA_DIR / "users.json"
@@ -35,13 +35,9 @@ CV_DIR.mkdir(exist_ok=True)
 
 # ─── Conversation States ───────────────────────────────────────
 (
-    # Setup
-    SETUP_EMAIL, SETUP_PASSWORD,
-    # New Job Profile
+    SETUP_EMAIL, SETUP_APIKEY,
     JP_NAME, JP_SUBJECT, JP_MESSAGE, JP_CV,
-    # Apply
     APPLY_PICK_PROFILE, APPLY_EMAIL,
-    # Delete profile confirm
     DEL_CONFIRM,
 ) = range(9)
 
@@ -57,13 +53,12 @@ def load_data() -> dict:
 def save_data(data: dict):
     DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def get_user(uid: str) -> dict:
-    data = load_data()
-    return data.get(uid, {})
+def get_user(u: str) -> dict:
+    return load_data().get(u, {})
 
-def set_user(uid: str, user: dict):
+def set_user(u: str, user: dict):
     data = load_data()
-    data[uid] = user
+    data[u] = user
     save_data(data)
 
 def uid(update: Update) -> str:
@@ -71,24 +66,29 @@ def uid(update: Update) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
-#  Email Sender (Gmail App Password)
+#  SendGrid Email Sender
 # ══════════════════════════════════════════════════════════════
-def send_email(gmail: str, app_password: str, to: str, subject: str, body: str, cv_path: Path | None):
-    msg = MIMEMultipart()
-    msg["From"]    = gmail
-    msg["To"]      = to
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-
-    if cv_path and cv_path.exists():
+def send_email(from_email: str, api_key: str, to: str, subject: str, body: str, cv_path):
+    sg = sendgrid.SendGridAPIClient(api_key=api_key)
+    message = Mail(
+        from_email=from_email,
+        to_emails=to,
+        subject=subject,
+        plain_text_content=body
+    )
+    if cv_path and Path(cv_path).exists():
         with open(cv_path, "rb") as f:
-            part = MIMEApplication(f.read(), _subtype="pdf")
-            part.add_header("Content-Disposition", "attachment", filename=cv_path.name)
-            msg.attach(part)
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(gmail, app_password)
-        server.sendmail(gmail, to, msg.as_string())
+            encoded = base64.b64encode(f.read()).decode()
+        attachment = Attachment(
+            FileContent(encoded),
+            FileName(Path(cv_path).name),
+            FileType("application/pdf"),
+            Disposition("attachment")
+        )
+        message.attachment = attachment
+    response = sg.send(message)
+    if response.status_code not in (200, 202):
+        raise Exception(f"SendGrid error: {response.status_code}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -96,7 +96,7 @@ def send_email(gmail: str, app_password: str, to: str, subject: str, body: str, 
 # ══════════════════════════════════════════════════════════════
 def main_menu_kb(user: dict) -> InlineKeyboardMarkup:
     rows = []
-    if not user.get("gmail"):
+    if not user.get("email"):
         rows.append([InlineKeyboardButton("⚙️ إعداد الحساب", callback_data="setup")])
     else:
         rows.append([InlineKeyboardButton("⚙️ تعديل الحساب", callback_data="setup")])
@@ -107,8 +107,7 @@ def main_menu_kb(user: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 def profiles_kb(profiles: dict, prefix: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(name, callback_data=f"{prefix}:{name}")]
-            for name in profiles]
+    rows = [[InlineKeyboardButton(name, callback_data=f"{prefix}:{name}")] for name in profiles]
     rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
 
@@ -120,17 +119,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     user = get_user(uid(update))
     name = update.effective_user.first_name
-
     status = ""
-    if user.get("gmail"):
-        status = f"\n📧 حسابك: `{user['gmail']}`"
-        profiles = user.get("profiles", {})
-        status += f"\n📁 مسمياتك: {len(profiles)}"
-
+    if user.get("email"):
+        status = f"\n📧 حسابك: `{user['email']}`"
+        status += f"\n📁 مسمياتك: {len(user.get('profiles', {}))}"
     await update.message.reply_text(
-        f"👋 أهلاً {name}!\n"
-        f"أنا بوت التقديم على الوظائف 🤖{status}\n\n"
-        "اختر من القائمة:",
+        f"👋 أهلاً {name}!\nأنا بوت التقديم على الوظائف 🤖{status}\n\nاختر من القائمة:",
         reply_markup=main_menu_kb(user),
         parse_mode="Markdown"
     )
@@ -150,56 +144,55 @@ async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "⚙️ *إعداد الحساب*\n\n"
-        "أرسل لي *إيميل Gmail* الخاص بك:",
+        "⚙️ *إعداد الحساب*\n\nأرسل لي *إيميلك* (اللي سيُرسل منه):",
         parse_mode="Markdown"
     )
     return SETUP_EMAIL
 
 async def setup_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     email = update.message.text.strip()
-    if "@gmail.com" not in email:
-        await update.message.reply_text("❌ يجب أن يكون إيميل Gmail. أعد المحاولة:")
+    if "@" not in email or "." not in email:
+        await update.message.reply_text("❌ إيميل غير صحيح. أعد المحاولة:")
         return SETUP_EMAIL
     context.user_data["setup_email"] = email
     await update.message.reply_text(
-        "🔑 الآن أرسل *كلمة مرور التطبيقات* (App Password)\n\n"
-        "📌 كيف تحصل عليها؟\n"
-        "1. روح على myaccount.google.com\n"
-        "2. الأمان ← التحقق بخطوتين (فعّله أولاً)\n"
-        "3. كلمات مرور التطبيقات ← أنشئ واحدة\n"
-        "4. انسخها هنا (16 حرف بدون مسافات)",
+        "🔑 الآن أرسل *SendGrid API Key*\n\n"
+        "📌 تجده في SendGrid:\nSettings ← API Keys ← Create API Key",
         parse_mode="Markdown"
     )
-    return SETUP_PASSWORD
+    return SETUP_APIKEY
 
-async def setup_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    password = update.message.text.strip().replace(" ", "")
-    await update.message.delete()  # نحذف الرسالة فوراً لحماية الباسورد
-
-    if len(password) != 16:
-        await update.message.reply_text("❌ كلمة المرور يجب أن تكون 16 حرف. أعد المحاولة:")
-        return SETUP_PASSWORD
-
-    # نختبر الاتصال
+async def setup_apikey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    api_key = update.message.text.strip()
+    await update.message.delete()
     await update.message.reply_text("⏳ جارٍ التحقق...")
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(context.user_data["setup_email"], password)
+        send_email(
+            from_email=context.user_data["setup_email"],
+            api_key=api_key,
+            to=context.user_data["setup_email"],
+            subject="✅ اختبار البوت",
+            body="البوت يعمل بنجاح! 🎉",
+            cv_path=None
+        )
     except Exception as e:
-        await update.message.reply_text(f"❌ فشل الاتصال: {e}\nتأكد من الإيميل وكلمة المرور.")
-        return SETUP_PASSWORD
+        await update.message.reply_text(
+            f"❌ فشل التحقق:\n`{e}`\n\nتأكد من الـ API Key وأن إيميلك مسجّل في SendGrid كـ Sender.",
+            parse_mode="Markdown"
+        )
+        return SETUP_APIKEY
 
     user = get_user(uid(update))
-    user["gmail"]    = context.user_data["setup_email"]
-    user["password"] = password
+    user["email"]   = context.user_data["setup_email"]
+    user["api_key"] = api_key
     if "profiles" not in user:
         user["profiles"] = {}
     set_user(uid(update), user)
 
     await update.message.reply_text(
-        "✅ تم ربط الحساب بنجاح!\n"
-        f"📧 `{user['gmail']}`",
+        "✅ *تم ربط الحساب بنجاح!*\n"
+        f"📧 `{user['email']}`\n\n"
+        "راح يوصلك إيميل اختبار ✉️",
         parse_mode="Markdown",
         reply_markup=main_menu_kb(user)
     )
@@ -214,9 +207,7 @@ async def new_profile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     context.user_data["new_profile"] = {}
     await query.edit_message_text(
-        "➕ *مسمى وظيفي جديد*\n\n"
-        "1️⃣ أرسل *اسم المسمى الوظيفي*\n"
-        "مثال: Backend Developer، مصمم جرافيك",
+        "➕ *مسمى وظيفي جديد*\n\n1️⃣ أرسل *اسم المسمى الوظيفي*\nمثال: Backend Developer",
         parse_mode="Markdown"
     )
     return JP_NAME
@@ -225,13 +216,11 @@ async def jp_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     user = get_user(uid(update))
     if name in user.get("profiles", {}):
-        await update.message.reply_text("⚠️ هذا الاسم موجود مسبقاً. أرسل اسم مختلف:")
+        await update.message.reply_text("⚠️ هذا الاسم موجود. أرسل اسم مختلف:")
         return JP_NAME
     context.user_data["new_profile"]["name"] = name
     await update.message.reply_text(
-        f"✅ الاسم: *{name}*\n\n"
-        "2️⃣ أرسل *موضوع الإيميل (Subject)*\n"
-        "مثال: Application for Backend Developer Position",
+        f"✅ الاسم: *{name}*\n\n2️⃣ أرسل *موضوع الإيميل*\nمثال: Application for {name} Position",
         parse_mode="Markdown"
     )
     return JP_SUBJECT
@@ -239,11 +228,8 @@ async def jp_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def jp_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_profile"]["subject"] = update.message.text.strip()
     await update.message.reply_text(
-        "3️⃣ أرسل *نص الرسالة (Body)*\n\n"
-        "💡 يمكنك استخدام:\n"
-        "`{name}` ← اسمك\n"
-        "`{role}` ← المسمى الوظيفي\n\n"
-        "مثال:\nDear Hiring Manager,\nI'm {name} applying for the {role} position...",
+        "3️⃣ أرسل *نص الرسالة*\n\n"
+        "💡 يمكنك استخدام:\n`{name}` ← اسمك\n`{role}` ← المسمى الوظيفي",
         parse_mode="Markdown"
     )
     return JP_MESSAGE
@@ -251,26 +237,13 @@ async def jp_subject(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def jp_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_profile"]["message"] = update.message.text.strip()
     await update.message.reply_text(
-        "4️⃣ أرسل ملف *CV بصيغة PDF* 📄\n\n"
-        "أو أرسل /skip إذا ما تريد إرفاق CV لهذا المسمى",
+        "4️⃣ أرسل ملف *CV بصيغة PDF* 📄\n\nأو أرسل /skip بدون CV",
         parse_mode="Markdown"
     )
     return JP_CV
 
-async def jp_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_profile(update, context, cv_filename=None):
     profile = context.user_data["new_profile"]
-    cv_filename = None
-
-    if update.message.document:
-        doc = update.message.document
-        if doc.mime_type != "application/pdf":
-            await update.message.reply_text("❌ يرجى إرسال ملف PDF فقط.")
-            return JP_CV
-        file = await doc.get_file()
-        cv_filename = f"{uid(update)}_{profile['name'].replace(' ', '_')}.pdf"
-        await file.download_to_drive(CV_DIR / cv_filename)
-
-    # حفظ البروفايل
     user = get_user(uid(update))
     if "profiles" not in user:
         user["profiles"] = {}
@@ -280,39 +253,26 @@ async def jp_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "cv":      cv_filename,
     }
     set_user(uid(update), user)
-
     await update.message.reply_text(
-        f"✅ *تم حفظ المسمى الوظيفي!*\n\n"
-        f"📌 الاسم: {profile['name']}\n"
-        f"📧 الموضوع: {profile['subject']}\n"
-        f"📄 CV: {'✅ مرفق' if cv_filename else '❌ بدون CV'}\n\n"
-        "القائمة الرئيسية:",
+        f"✅ *تم حفظ المسمى!*\n\n📌 {profile['name']}\n📄 CV: {'✅' if cv_filename else '❌'}",
         parse_mode="Markdown",
         reply_markup=main_menu_kb(user)
     )
     return ConversationHandler.END
+
+async def jp_cv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if doc.mime_type != "application/pdf":
+        await update.message.reply_text("❌ يرجى إرسال ملف PDF فقط.")
+        return JP_CV
+    profile = context.user_data["new_profile"]
+    file = await doc.get_file()
+    cv_filename = f"{uid(update)}_{profile['name'].replace(' ', '_')}.pdf"
+    await file.download_to_drive(CV_DIR / cv_filename)
+    return await save_profile(update, context, cv_filename)
 
 async def jp_cv_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # نفس منطق jp_cv بدون ملف
-    profile = context.user_data["new_profile"]
-    user = get_user(uid(update))
-    if "profiles" not in user:
-        user["profiles"] = {}
-    user["profiles"][profile["name"]] = {
-        "subject": profile["subject"],
-        "message": profile["message"],
-        "cv":      None,
-    }
-    set_user(uid(update), user)
-
-    await update.message.reply_text(
-        f"✅ *تم حفظ المسمى الوظيفي بدون CV*\n\n"
-        f"📌 {profile['name']}\n\n"
-        "القائمة الرئيسية:",
-        parse_mode="Markdown",
-        reply_markup=main_menu_kb(user)
-    )
-    return ConversationHandler.END
+    return await save_profile(update, context, None)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -323,78 +283,54 @@ async def list_profiles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user = get_user(uid(update))
     profiles = user.get("profiles", {})
-
     if not profiles:
-        await query.edit_message_text("📭 ما عندك مسميات وظيفية بعد.", reply_markup=main_menu_kb(user))
+        await query.edit_message_text("📭 ما عندك مسميات بعد.", reply_markup=main_menu_kb(user))
         return
-
-    lines = []
-    for name, p in profiles.items():
-        cv_icon = "📄" if p.get("cv") else "—"
-        lines.append(f"• *{name}* | موضوع: {p['subject'][:30]} | CV: {cv_icon}")
-
+    lines = [f"• *{n}* | CV: {'📄' if p.get('cv') else '—'}" for n, p in profiles.items()]
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🗑 حذف: {n}", callback_data=f"del:{n}")]
-        for n in profiles
+        [InlineKeyboardButton(f"🗑 حذف: {n}", callback_data=f"del:{n}")] for n in profiles
     ] + [[InlineKeyboardButton("🔙 رجوع", callback_data="back_main")]])
-
     await query.edit_message_text(
-        "📋 *مسمياتك الوظيفية:*\n\n" + "\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=kb
+        "📋 *مسمياتك:*\n\n" + "\n".join(lines),
+        parse_mode="Markdown", reply_markup=kb
     )
 
 async def delete_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    profile_name = query.data.split(":", 1)[1]
-    context.user_data["del_profile"] = profile_name
-
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ نعم، احذف", callback_data=f"del_confirm:{profile_name}"),
-         InlineKeyboardButton("❌ لا", callback_data="list_profiles")]
-    ])
-    await query.edit_message_text(
-        f"🗑 هل تريد حذف *{profile_name}*؟",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
+    name = query.data.split(":", 1)[1]
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ نعم", callback_data=f"del_confirm:{name}"),
+        InlineKeyboardButton("❌ لا", callback_data="list_profiles")
+    ]])
+    await query.edit_message_text(f"🗑 حذف *{name}*؟", parse_mode="Markdown", reply_markup=kb)
 
 async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    profile_name = query.data.split(":", 1)[1]
+    name = query.data.split(":", 1)[1]
     user = get_user(uid(update))
-
-    p = user.get("profiles", {}).pop(profile_name, None)
+    p = user.get("profiles", {}).pop(name, None)
     if p and p.get("cv"):
-        cv_file = CV_DIR / p["cv"]
-        if cv_file.exists():
-            cv_file.unlink()
-
+        f = CV_DIR / p["cv"]
+        if f.exists(): f.unlink()
     set_user(uid(update), user)
-    await query.edit_message_text(
-        f"✅ تم حذف *{profile_name}*",
-        parse_mode="Markdown",
-        reply_markup=main_menu_kb(user)
-    )
+    await query.edit_message_text(f"✅ تم حذف *{name}*", parse_mode="Markdown", reply_markup=main_menu_kb(user))
 
 
 # ══════════════════════════════════════════════════════════════
-#  Apply — تقديم جديد
+#  Apply
 # ══════════════════════════════════════════════════════════════
 async def apply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user = get_user(uid(update))
     profiles = user.get("profiles", {})
-
     if not profiles:
-        await query.edit_message_text("❌ ما عندك مسميات وظيفية. أضف واحد أولاً.", reply_markup=main_menu_kb(user))
+        await query.edit_message_text("❌ ما عندك مسميات. أضف واحد أولاً.", reply_markup=main_menu_kb(user))
         return ConversationHandler.END
-
     await query.edit_message_text(
-        "🚀 *تقديم جديد*\n\nاختر المسمى الوظيفي:",
+        "🚀 *تقديم جديد*\n\nاختر المسمى:",
         parse_mode="Markdown",
         reply_markup=profiles_kb(profiles, "apply_pick")
     )
@@ -405,10 +341,8 @@ async def apply_pick_profile(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     profile_name = query.data.split(":", 1)[1]
     context.user_data["apply_profile"] = profile_name
-
     await query.edit_message_text(
-        f"✅ المسمى: *{profile_name}*\n\n"
-        "📧 الآن أرسل *إيميل الشركة أو HR*:",
+        f"✅ المسمى: *{profile_name}*\n\n📧 أرسل *إيميل الشركة أو HR*:",
         parse_mode="Markdown"
     )
     return APPLY_EMAIL
@@ -422,37 +356,19 @@ async def apply_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(uid(update))
     profile_name = context.user_data["apply_profile"]
     profile = user["profiles"][profile_name]
-
-    # تخصيص الرسالة
-    body = profile["message"].replace("{name}", user.get("gmail", "").split("@")[0])
-    body = body.replace("{role}", profile_name)
-
+    body = profile["message"].replace("{name}", user["email"].split("@")[0]).replace("{role}", profile_name)
     cv_path = CV_DIR / profile["cv"] if profile.get("cv") else None
 
     await update.message.reply_text("⏳ جارٍ الإرسال...")
     try:
-        send_email(
-            gmail=user["gmail"],
-            app_password=user["password"],
-            to=to_email,
-            subject=profile["subject"],
-            body=body,
-            cv_path=cv_path
-        )
+        send_email(user["email"], user["api_key"], to_email, profile["subject"], body, cv_path)
         await update.message.reply_text(
-            f"✅ *تم الإرسال بنجاح!*\n\n"
-            f"📌 المسمى: {profile_name}\n"
-            f"📧 إلى: {to_email}\n"
-            f"📄 CV: {'مرفق ✅' if cv_path else 'بدون CV'}",
+            f"✅ *تم الإرسال!*\n\n📌 {profile_name}\n📧 إلى: {to_email}\n📄 CV: {'✅' if cv_path else '❌'}",
             parse_mode="Markdown",
             reply_markup=main_menu_kb(user)
         )
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ فشل الإرسال:\n`{e}`\n\nتحقق من إعدادات حسابك.",
-            parse_mode="Markdown",
-            reply_markup=main_menu_kb(user)
-        )
+        await update.message.reply_text(f"❌ فشل:\n`{e}`", parse_mode="Markdown", reply_markup=main_menu_kb(user))
     return ConversationHandler.END
 
 
@@ -470,22 +386,20 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  Main
 # ══════════════════════════════════════════════════════════════
 def main():
-    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "YOUR_TELEGRAM_TOKEN_HERE":
-        raise SystemExit("❌ TELEGRAM_TOKEN غير موجود في البيئة")
+    if not TELEGRAM_TOKEN:
+        raise SystemExit("❌ TELEGRAM_TOKEN غير موجود")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # ── Setup conversation ──
     setup_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(setup_start, pattern="^setup$")],
         states={
-            SETUP_EMAIL:    [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_email)],
-            SETUP_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_password)],
+            SETUP_EMAIL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_email)],
+            SETUP_APIKEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, setup_apikey)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # ── New Profile conversation ──
     profile_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(new_profile_start, pattern="^new_profile$")],
         states={
@@ -500,7 +414,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # ── Apply conversation ──
     apply_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(apply_start, pattern="^apply$")],
         states={
@@ -510,15 +423,14 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # ── Handlers ──
     app.add_handler(CommandHandler("start", start))
     app.add_handler(setup_conv)
     app.add_handler(profile_conv)
     app.add_handler(apply_conv)
-    app.add_handler(CallbackQueryHandler(list_profiles,   pattern="^list_profiles$"))
-    app.add_handler(CallbackQueryHandler(delete_profile,  pattern="^del:"))
-    app.add_handler(CallbackQueryHandler(delete_confirm,  pattern="^del_confirm:"))
-    app.add_handler(CallbackQueryHandler(back_main,       pattern="^back_main$"))
+    app.add_handler(CallbackQueryHandler(list_profiles,  pattern="^list_profiles$"))
+    app.add_handler(CallbackQueryHandler(delete_profile, pattern="^del:"))
+    app.add_handler(CallbackQueryHandler(delete_confirm, pattern="^del_confirm:"))
+    app.add_handler(CallbackQueryHandler(back_main,      pattern="^back_main$"))
 
     log.info("🤖 البوت شغّال...")
     app.run_polling()
